@@ -4,35 +4,26 @@ import Vision
 import UIKit
 import Combine
 
-// MARK: - YOLOv11 Detector
 class GroceryDetector: ObservableObject {
-    
-    // MARK: - Published State
+
     @Published var detections: [DetectionResult] = []
     @Published var isModelLoaded: Bool = false
     @Published var errorMessage: String?
-    
-    // MARK: - Private
-    private var model: MLModel?
+
     private var visionModel: VNCoreMLModel?
     private var request: VNCoreMLRequest?
-    
-    // Detection settings
-    let confidenceThreshold: Float = 0.45
+
+    let confidenceThreshold: Float = 0.35
     let iouThreshold: Float = 0.45
-    
-    // MARK: - Init
-    init() {
-        loadModel()
-    }
-    
+    private let numClasses = 16
+
+    init() { loadModel() }
+
     // MARK: - Load Model
     private func loadModel() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
-                // Xcode compiles .mlpackage -> .mlmodelc at build time.
-                // Try mlmodelc first, then mlpackage as fallback.
                 let modelURL: URL
                 if let url = Bundle.main.url(forResource: "best", withExtension: "mlmodelc") {
                     print("✅ Found best.mlmodelc")
@@ -41,173 +32,187 @@ class GroceryDetector: ObservableObject {
                     print("✅ Found best.mlpackage")
                     modelURL = url
                 } else {
-                    // Debug: list bundle contents
-                    let bundlePath = Bundle.main.bundlePath
-                    let contents = (try? FileManager.default.contentsOfDirectory(atPath: bundlePath)) ?? []
-                    let mlFiles = contents.filter { $0.contains("ml") || $0.contains("best") }
-                    print("❌ Model not found")
-                    print("📦 Bundle: \(bundlePath)")
-                    print("📦 ML files: \(mlFiles)")
-                    print("📦 All files: \(contents)")
+                    let contents = (try? FileManager.default.contentsOfDirectory(atPath: Bundle.main.bundlePath)) ?? []
+                    print("❌ Model not found. Bundle contents: \(contents)")
                     DispatchQueue.main.async {
-                        self.errorMessage = "Model tidak ditemukan. Cek Xcode console untuk debug. ML files: \(mlFiles)"
+                        self.errorMessage = "Model tidak ditemukan. Files: \(contents.filter { $0.contains("ml") || $0.contains("best") })"
                     }
                     return
                 }
-                
+
                 let config = MLModelConfiguration()
-                config.computeUnits = .all  // GPU + ANE
-                
+                config.computeUnits = .all
+
                 let mlModel = try MLModel(contentsOf: modelURL, configuration: config)
-                let vnModel = try VNCoreMLModel(for: mlModel)
                 
-                // Create Vision request
+                // Log model input/output description for debugging
+                let desc = mlModel.modelDescription
+                print("📐 Model inputs: \(desc.inputDescriptionsByName.keys)")
+                print("📐 Model outputs: \(desc.outputDescriptionsByName.keys)")
+                for (name, out) in desc.outputDescriptionsByName {
+                    print("  output '\(name)': \(out.type) \(out.multiArrayConstraint?.shape ?? [])")
+                }
+
+                let vnModel = try VNCoreMLModel(for: mlModel)
                 let req = VNCoreMLRequest(model: vnModel) { [weak self] request, error in
-                    self?.handleDetectionResults(request: request, error: error)
+                    if let error { print("Vision error: \(error)"); return }
+                    self?.handleDetectionResults(request: request)
                 }
                 req.imageCropAndScaleOption = .scaleFill
-                
+
                 DispatchQueue.main.async {
-                    self.model = mlModel
                     self.visionModel = vnModel
                     self.request = req
                     self.isModelLoaded = true
+                    print("✅ Model loaded successfully")
                 }
-                
             } catch {
+                print("❌ Load error: \(error)")
                 DispatchQueue.main.async {
                     self.errorMessage = "Gagal load model: \(error.localizedDescription)"
                 }
             }
         }
     }
-    
-    // MARK: - Run Detection
+
+    // MARK: - Detect
     func detect(pixelBuffer: CVPixelBuffer) {
-        guard let request = request else { return }
-        
+        guard let request else { return }
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        
         DispatchQueue.global(qos: .userInteractive).async {
-            do {
-                try handler.perform([request])
-            } catch {
-                print("Detection error: \(error)")
-            }
+            do { try handler.perform([request]) }
+            catch { print("Perform error: \(error)") }
         }
     }
-    
-    // MARK: - Handle Results
-    private func handleDetectionResults(request: VNRequest, error: Error?) {
-        guard let results = request.results else { return }
-        
+
+    // MARK: - Handle results
+    private func handleDetectionResults(request: VNRequest) {
+        guard let results = request.results, !results.isEmpty else {
+            DispatchQueue.main.async { self.detections = [] }
+            return
+        }
+
         var newDetections: [DetectionResult] = []
-        
-        // Handle VNRecognizedObjectObservation (standard YOLO output via Vision)
+
+        // Case 1: Vision already parsed YOLO output into objects
         if let observations = results as? [VNRecognizedObjectObservation] {
+            print("📦 Got \(observations.count) VNRecognizedObjectObservation")
             for obs in observations {
-                guard obs.confidence >= confidenceThreshold else { continue }
-                guard let topLabel = obs.labels.first else { continue }
-                
-                let classIndex = classIndexFromLabel(topLabel.identifier)
-                let confidence = topLabel.confidence
-                
-                guard confidence >= confidenceThreshold else { continue }
-                
-                // Vision bbox: normalized, origin bottom-left → convert to top-left
-                let bbox = obs.boundingBox
-                let converted = CGRect(
-                    x: bbox.minX,
-                    y: 1.0 - bbox.maxY,
-                    width: bbox.width,
-                    height: bbox.height
-                )
-                
-                newDetections.append(DetectionResult(
-                    classIndex: classIndex,
-                    confidence: confidence,
-                    boundingBox: converted
-                ))
+                guard let top = obs.labels.first, top.confidence >= confidenceThreshold else { continue }
+                let classIndex = classIndexFromLabel(top.identifier)
+                let bb = obs.boundingBox  // normalized, origin bottom-left
+                let converted = CGRect(x: bb.minX, y: 1.0 - bb.maxY, width: bb.width, height: bb.height)
+                newDetections.append(DetectionResult(classIndex: classIndex, confidence: top.confidence, boundingBox: converted))
             }
         }
-        // Handle raw MLMultiArray output
-        else if let featureValueObs = results as? [VNCoreMLFeatureValueObservation] {
-            newDetections = parseRawOutput(featureValueObs)
+        // Case 2: Raw tensor output — parse safely
+        else if let observations = results as? [VNCoreMLFeatureValueObservation] {
+            print("📦 Got \(observations.count) VNCoreMLFeatureValueObservation")
+            for obs in observations {
+                print("  feature '\(obs.featureName)': \(obs.featureValue.type)")
+            }
+            newDetections = safeParseRawOutput(observations)
         }
-        
-        let filtered = applyNMS(detections: newDetections, iouThreshold: iouThreshold)
-        
-        DispatchQueue.main.async { [weak self] in
-            self?.detections = filtered
+        else {
+            print("⚠️ Unknown result type: \(type(of: results.first))")
         }
+
+        let filtered = applyNMS(detections: newDetections)
+        print("🎯 Detections after NMS: \(filtered.count)")
+        DispatchQueue.main.async { self.detections = filtered }
     }
-    
-    // MARK: - Parse raw YOLOv11 tensor output
-    private func parseRawOutput(_ observations: [VNCoreMLFeatureValueObservation]) -> [DetectionResult] {
-        var results: [DetectionResult] = []
-        
-        guard let first = observations.first,
-              let multiArray = first.featureValue.multiArrayValue else {
-            return results
-        }
-        
+
+    // MARK: - Safe raw tensor parser
+    // YOLOv11 output shape: [1, 20, 8400] where 20 = 4 (box) + 16 (classes)
+    // OR transposed: [1, 8400, 20]
+    private func safeParseRawOutput(_ observations: [VNCoreMLFeatureValueObservation]) -> [DetectionResult] {
+        guard let obs = observations.first,
+              let multiArray = obs.featureValue.multiArrayValue else { return [] }
+
         let shape = multiArray.shape.map { $0.intValue }
-        guard shape.count >= 2 else { return results }
-        
-        let numClasses = 16
-        let numAnchors: Int
-        let numFeatures: Int
-        
-        if shape.last == numClasses + 4 {
-            numAnchors = shape[shape.count - 2]
-            numFeatures = numClasses + 4
-        } else if shape[shape.count - 2] == numClasses + 4 {
-            numAnchors = shape.last ?? 8400
-            numFeatures = numClasses + 4
+        print("🔢 Output shape: \(shape)")
+
+        let featCount = numClasses + 4  // 20
+
+        // Determine layout
+        // [batch, featCount, anchors] → transposed=false
+        // [batch, anchors, featCount] → transposed=true
+        let anchors: Int
+        let transposed: Bool
+
+        if shape.count == 3 {
+            if shape[1] == featCount {
+                anchors = shape[2]
+                transposed = false
+                print("📐 Layout: [batch=\(shape[0]), features=\(shape[1]), anchors=\(shape[2])]")
+            } else if shape[2] == featCount {
+                anchors = shape[1]
+                transposed = true
+                print("📐 Layout: [batch=\(shape[0]), anchors=\(shape[1]), features=\(shape[2])] (transposed)")
+            } else {
+                print("⚠️ Unexpected shape: \(shape)")
+                return []
+            }
+        } else if shape.count == 2 {
+            if shape[0] == featCount {
+                anchors = shape[1]; transposed = false
+            } else {
+                anchors = shape[0]; transposed = true
+            }
         } else {
-            numAnchors = 8400
-            numFeatures = numClasses + 4
+            print("⚠️ Cannot handle shape: \(shape)")
+            return []
         }
-        
-        let ptr = UnsafeMutablePointer<Double>(OpaquePointer(multiArray.dataPointer))
-        
-        for i in 0..<numAnchors {
-            let cx = ptr[i * numFeatures + 0]
-            let cy = ptr[i * numFeatures + 1]
-            let w  = ptr[i * numFeatures + 2]
-            let h  = ptr[i * numFeatures + 3]
-            
-            var maxConf: Double = 0
+
+        var results: [DetectionResult] = []
+
+        // Use safe Swift subscript instead of raw pointer
+        for i in 0..<anchors {
+            func val(_ f: Int) -> Float {
+                let idx: Int
+                if transposed {
+                    idx = i * featCount + f
+                } else {
+                    idx = f * anchors + i
+                }
+                return multiArray[idx].floatValue
+            }
+
+            let cx = val(0), cy = val(1), w = val(2), h = val(3)
+
+            var maxConf: Float = 0
             var maxClass = 0
             for c in 0..<numClasses {
-                let conf = ptr[i * numFeatures + 4 + c]
-                if conf > maxConf {
-                    maxConf = conf
-                    maxClass = c
-                }
+                let conf = val(4 + c)
+                if conf > maxConf { maxConf = conf; maxClass = c }
             }
-            
-            let confidence = Float(maxConf)
-            guard confidence >= confidenceThreshold else { continue }
-            
-            let x = CGFloat((cx - w/2) / 640)
-            let y = CGFloat((cy - h/2) / 640)
+
+            guard maxConf >= confidenceThreshold else { continue }
+
+            // Normalize to 0..1 (model input 640x640)
+            let x = CGFloat((cx - w / 2) / 640)
+            let y = CGFloat((cy - h / 2) / 640)
             let bw = CGFloat(w / 640)
             let bh = CGFloat(h / 640)
-            
-            let bbox = CGRect(x: x, y: y, width: bw, height: bh)
-            results.append(DetectionResult(classIndex: maxClass, confidence: confidence, boundingBox: bbox))
+
+            guard bw > 0, bh > 0, x >= -0.5, y >= -0.5 else { continue }
+
+            results.append(DetectionResult(
+                classIndex: maxClass,
+                confidence: maxConf,
+                boundingBox: CGRect(x: x, y: y, width: bw, height: bh)
+            ))
         }
-        
+
+        print("🔍 Raw detections before NMS: \(results.count)")
         return results
     }
-    
+
     // MARK: - NMS
-    private func applyNMS(detections: [DetectionResult], iouThreshold: Float) -> [DetectionResult] {
+    private func applyNMS(detections: [DetectionResult]) -> [DetectionResult] {
         let sorted = detections.sorted { $0.confidence > $1.confidence }
         var kept: [DetectionResult] = []
         var suppressed = [Bool](repeating: false, count: sorted.count)
-        
         for i in 0..<sorted.count {
             guard !suppressed[i] else { continue }
             kept.append(sorted[i])
@@ -219,17 +224,15 @@ class GroceryDetector: ObservableObject {
         }
         return kept
     }
-    
+
     private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
-        let intersection = a.intersection(b)
-        guard !intersection.isNull else { return 0 }
-        let intersectionArea = intersection.width * intersection.height
-        let unionArea = a.width * a.height + b.width * b.height - intersectionArea
-        guard unionArea > 0 else { return 0 }
-        return intersectionArea / unionArea
+        let inter = a.intersection(b)
+        guard !inter.isNull else { return 0 }
+        let interArea = inter.width * inter.height
+        let unionArea = a.width * a.height + b.width * b.height - interArea
+        return unionArea > 0 ? interArea / unionArea : 0
     }
-    
-    // MARK: - Helper: label string -> class index
+
     private func classIndexFromLabel(_ label: String) -> Int {
         if let idx = Int(label) { return idx }
         for (idx, product) in ProductDatabase.products {
