@@ -16,8 +16,73 @@ class GroceryDetector: ObservableObject {
     let confidenceThreshold: Float = 0.35
     let iouThreshold: Float = 0.45
     private let numClasses = 16
+    
+    // Bounding box smoothing
+    private var smoothedDetections: [Int: SmoothedBBox] = [:]  // classIndex -> smoothed bbox
+    private let bboxSmoothingAlpha: CGFloat = 0.4  // 40% weight on current frame
 
     init() { loadModel() }
+    
+    // MARK: - Detection Smoothing
+    
+    private struct SmoothedBBox {
+        var bbox: CGRect
+        var confidence: Float
+        var lastSeen: Date
+    }
+    
+    /// Apply EMA smoothing to detections untuk stabilize bounding boxes
+    private func smoothDetections(_ detections: [DetectionResult]) -> [DetectionResult] {
+        let now = Date()
+        let stalenessThreshold: TimeInterval = 0.5  // 500ms
+        
+        // Remove stale smoothed detections (not seen for a while)
+        smoothedDetections = smoothedDetections.filter { _, val in
+            now.timeIntervalSince(val.lastSeen) < stalenessThreshold
+        }
+        
+        var smoothedResults: [DetectionResult] = []
+        
+        for det in detections {
+            let key = "\(det.classIndex)_\(det.confidence)".hashValue  // Simple key combining class and confidence
+            
+            if let existing = smoothedDetections[det.classIndex] {
+                // Apply EMA smoothing to bounding box
+                let smoothedBBox = CGRect(
+                    x: bboxSmoothingAlpha * det.boundingBox.minX + (1 - bboxSmoothingAlpha) * existing.bbox.minX,
+                    y: bboxSmoothingAlpha * det.boundingBox.minY + (1 - bboxSmoothingAlpha) * existing.bbox.minY,
+                    width: bboxSmoothingAlpha * det.boundingBox.width + (1 - bboxSmoothingAlpha) * existing.bbox.width,
+                    height: bboxSmoothingAlpha * det.boundingBox.height + (1 - bboxSmoothingAlpha) * existing.bbox.height
+                )
+                
+                let smoothedConf = Float(bboxSmoothingAlpha) * det.confidence + Float(1 - bboxSmoothingAlpha) * existing.confidence
+                
+                smoothedDetections[det.classIndex] = SmoothedBBox(
+                    bbox: smoothedBBox,
+                    confidence: smoothedConf,
+                    lastSeen: now
+                )
+                
+                smoothedResults.append(DetectionResult(
+                    classIndex: det.classIndex,
+                    confidence: smoothedConf,
+                    boundingBox: smoothedBBox
+                ))
+            } else {
+                // First time seeing this class — initialize smoothing
+                smoothedDetections[det.classIndex] = SmoothedBBox(
+                    bbox: det.boundingBox,
+                    confidence: det.confidence,
+                    lastSeen: now
+                )
+                smoothedResults.append(det)
+            }
+        }
+        
+        return smoothedResults
+    }
+
+    // MARK: - Load Model
 
     // MARK: - Load Model
     private func loadModel() {
@@ -118,8 +183,9 @@ class GroceryDetector: ObservableObject {
         }
 
         let filtered = applyNMS(detections: newDetections)
-        print("🎯 Detections after NMS: \(filtered.count)")
-        DispatchQueue.main.async { self.detections = filtered }
+        let smoothed = smoothDetections(filtered)  // Apply EMA smoothing untuk stabilize boxes
+        print("🎯 Detections after smoothing: \(smoothed.count)")
+        DispatchQueue.main.async { self.detections = smoothed }
     }
 
     // MARK: - Safe raw tensor parser
