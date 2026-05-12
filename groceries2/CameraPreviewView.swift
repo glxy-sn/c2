@@ -176,7 +176,7 @@ class PreviewUIView: UIView {
     var session: AVCaptureSession? {
         didSet {
             previewLayer.session = session
-            previewLayer.videoGravity = .resizeAspectFill
+            previewLayer.videoGravity = .resizeAspect
         }
     }
     override func layoutSubviews() {

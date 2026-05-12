@@ -28,7 +28,7 @@ struct ContentView: View {
 
                     // Bounding box overlay — gesture-based only
                     if scannerActive && !detector.detections.isEmpty {
-                        let camSize = CGSize(width: geo.size.width, height: geo.size.height * 0.58)
+                        let camSize = CGSize(width: geo.size.width, height: geo.size.height * 1)
                         BoundingBoxOverlay(
                             detections: detector.detections,
                             viewSize: camSize,
@@ -39,7 +39,7 @@ struct ContentView: View {
                     // Hand skeleton overlay
                     HandOverlayView(
                         landmarks: basketManager.landmarks,
-                        size: CGSize(width: geo.size.width, height: geo.size.height * 0.58)
+                        size: CGSize(width: geo.size.width, height: geo.size.height * 1)
                     )
 
                     // Top control bar
@@ -154,11 +154,16 @@ struct ContentView: View {
                         .padding(.leading, 12).padding(.bottom, 8)
                     }
                 }
-                .frame(height: geo.size.height * 0.58)
-
-                // MARK: - Cart panel (bottom 42%)
-                CartPanelView(cartManager: cartManager, onCheckout: { showCheckout = true })
+                .frame(height: geo.size.height * 1)
+                .overlay(alignment: .bottom) {
+                    CartPanelView(
+                        cartManager: cartManager,
+                        onCheckout: { showCheckout = true }
+                    )
                     .frame(height: geo.size.height * 0.42)
+                }
+
+                
             }
             .ignoresSafeArea(edges: .top)
         }
@@ -191,7 +196,7 @@ struct ContentView: View {
         // ── Detection + landmarks → process for depth-based gesture ─────────
         .onReceive(detector.$detections) { newDetections in
             let camSize = CGSize(width: UIScreen.main.bounds.width,
-                               height: UIScreen.main.bounds.height * 0.58)
+                               height: UIScreen.main.bounds.height * 1)
             basketManager.processFrame(detections: newDetections, viewSize: camSize)
         }
 
