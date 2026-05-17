@@ -4,6 +4,16 @@ import Vision
 import UIKit
 import Combine
 
+// MARK: - Tracked Detection (internal)
+private struct TrackedDetection {
+    let id: UUID
+    var classIndex: Int
+    var smoothedConfidence: Float
+    var smoothedBox: CGRect
+    var missedFrames: Int = 0
+    var confirmedFrames: Int = 0  // berapa frame sudah muncul berturut
+}
+
 class GroceryDetector: ObservableObject {
 
     @Published var detections: [DetectionResult] = []
@@ -13,76 +23,20 @@ class GroceryDetector: ObservableObject {
     private var visionModel: VNCoreMLModel?
     private var request: VNCoreMLRequest?
 
-    let confidenceThreshold: Float = 0.35
-    let iouThreshold: Float = 0.45
+    let confidenceThreshold: Float = 0.55
+    let iouThreshold: Float = 0.30
     private let numClasses = 16
-    
-    // Bounding box smoothing
-    private var smoothedDetections: [Int: SmoothedBBox] = [:]  // classIndex -> smoothed bbox
-    private let bboxSmoothingAlpha: CGFloat = 0.4  // 40% weight on current frame
+
+    // MARK: - Temporal Smoothing Config
+    private let emaAlpha: Float = 0.30            // smoothing speed
+    private let maxMissedFrames: Int = 10         // frame sebelum dihapus
+    private let minFramesToShow: Int = 1          // frame sebelum ditampilkan
+    private let matchIoUThreshold: CGFloat = 0.25 // IoU minimum buat match ke tracked obj
+
+    // Key: UUID per instance objek — beda dari sebelumnya yang pakai classIndex
+    private var trackedDetections: [UUID: TrackedDetection] = [:]
 
     init() { loadModel() }
-    
-    // MARK: - Detection Smoothing
-    
-    private struct SmoothedBBox {
-        var bbox: CGRect
-        var confidence: Float
-        var lastSeen: Date
-    }
-    
-    /// Apply EMA smoothing to detections untuk stabilize bounding boxes
-    private func smoothDetections(_ detections: [DetectionResult]) -> [DetectionResult] {
-        let now = Date()
-        let stalenessThreshold: TimeInterval = 0.5  // 500ms
-        
-        // Remove stale smoothed detections (not seen for a while)
-        smoothedDetections = smoothedDetections.filter { _, val in
-            now.timeIntervalSince(val.lastSeen) < stalenessThreshold
-        }
-        
-        var smoothedResults: [DetectionResult] = []
-        
-        for det in detections {
-            let key = "\(det.classIndex)_\(det.confidence)".hashValue  // Simple key combining class and confidence
-            
-            if let existing = smoothedDetections[det.classIndex] {
-                // Apply EMA smoothing to bounding box
-                let smoothedBBox = CGRect(
-                    x: bboxSmoothingAlpha * det.boundingBox.minX + (1 - bboxSmoothingAlpha) * existing.bbox.minX,
-                    y: bboxSmoothingAlpha * det.boundingBox.minY + (1 - bboxSmoothingAlpha) * existing.bbox.minY,
-                    width: bboxSmoothingAlpha * det.boundingBox.width + (1 - bboxSmoothingAlpha) * existing.bbox.width,
-                    height: bboxSmoothingAlpha * det.boundingBox.height + (1 - bboxSmoothingAlpha) * existing.bbox.height
-                )
-                
-                let smoothedConf = Float(bboxSmoothingAlpha) * det.confidence + Float(1 - bboxSmoothingAlpha) * existing.confidence
-                
-                smoothedDetections[det.classIndex] = SmoothedBBox(
-                    bbox: smoothedBBox,
-                    confidence: smoothedConf,
-                    lastSeen: now
-                )
-                
-                smoothedResults.append(DetectionResult(
-                    classIndex: det.classIndex,
-                    confidence: smoothedConf,
-                    boundingBox: smoothedBBox
-                ))
-            } else {
-                // First time seeing this class — initialize smoothing
-                smoothedDetections[det.classIndex] = SmoothedBBox(
-                    bbox: det.boundingBox,
-                    confidence: det.confidence,
-                    lastSeen: now
-                )
-                smoothedResults.append(det)
-            }
-        }
-        
-        return smoothedResults
-    }
-
-    // MARK: - Load Model
 
     // MARK: - Load Model
     private func loadModel() {
@@ -109,8 +63,7 @@ class GroceryDetector: ObservableObject {
                 config.computeUnits = .all
 
                 let mlModel = try MLModel(contentsOf: modelURL, configuration: config)
-                
-                // Log model input/output description for debugging
+
                 let desc = mlModel.modelDescription
                 print("📐 Model inputs: \(desc.inputDescriptionsByName.keys)")
                 print("📐 Model outputs: \(desc.outputDescriptionsByName.keys)")
@@ -150,47 +103,121 @@ class GroceryDetector: ObservableObject {
         }
     }
 
-    // MARK: - Handle results
+    // MARK: - Handle Results
     private func handleDetectionResults(request: VNRequest) {
         guard let results = request.results, !results.isEmpty else {
-            DispatchQueue.main.async { self.detections = [] }
+            let smoothed = updateTracker(with: [])
+            DispatchQueue.main.async { self.detections = smoothed }
             return
         }
 
         var newDetections: [DetectionResult] = []
 
-        // Case 1: Vision already parsed YOLO output into objects
         if let observations = results as? [VNRecognizedObjectObservation] {
             print("📦 Got \(observations.count) VNRecognizedObjectObservation")
             for obs in observations {
                 guard let top = obs.labels.first, top.confidence >= confidenceThreshold else { continue }
                 let classIndex = classIndexFromLabel(top.identifier)
-                let bb = obs.boundingBox  // normalized, origin bottom-left
+                let bb = obs.boundingBox
                 let converted = CGRect(x: bb.minX, y: 1.0 - bb.maxY, width: bb.width, height: bb.height)
                 newDetections.append(DetectionResult(classIndex: classIndex, confidence: top.confidence, boundingBox: converted))
             }
-        }
-        // Case 2: Raw tensor output — parse safely
-        else if let observations = results as? [VNCoreMLFeatureValueObservation] {
+        } else if let observations = results as? [VNCoreMLFeatureValueObservation] {
             print("📦 Got \(observations.count) VNCoreMLFeatureValueObservation")
-            for obs in observations {
-                print("  feature '\(obs.featureName)': \(obs.featureValue.type)")
-            }
             newDetections = safeParseRawOutput(observations)
-        }
-        else {
+        } else {
             print("⚠️ Unknown result type: \(type(of: results.first))")
         }
 
-        let filtered = applyNMS(detections: newDetections)
-        let smoothed = smoothDetections(filtered)  // Apply EMA smoothing untuk stabilize boxes
-        print("🎯 Detections after smoothing: \(smoothed.count)")
+        let afterNMS = applyNMS(detections: newDetections)
+        print("🎯 Detections after NMS: \(afterNMS.count)")
+
+        let smoothed = updateTracker(with: afterNMS)
         DispatchQueue.main.async { self.detections = smoothed }
     }
 
-    // MARK: - Safe raw tensor parser
-    // YOLOv11 output shape: [1, 20, 8400] where 20 = 4 (box) + 16 (classes)
-    // OR transposed: [1, 8400, 20]
+    // MARK: - IoU-based Instance Tracker
+    // Perbedaan utama dari versi lama:
+    // - Tiap objek punya UUID sendiri, bukan pakai classIndex sebagai key
+    // - Match pakai IoU, bukan asumsi 1 class = 1 objek
+    // - confirmedFrames tidak di-reset kalau hilang sebentar
+    private func updateTracker(with newDetections: [DetectionResult]) -> [DetectionResult] {
+        var matchedIDs = Set<UUID>()
+
+        var unmatchedDetections: [DetectionResult] = []
+
+        for det in newDetections {
+            // Cari tracked object yang paling overlap dengan class yang sama
+            var bestID: UUID? = nil
+            var bestIoU: CGFloat = matchIoUThreshold
+
+            for (id, tracked) in trackedDetections {
+                guard tracked.classIndex == det.classIndex else { continue }
+                guard !matchedIDs.contains(id) else { continue }
+                let overlap = iou(tracked.smoothedBox, det.boundingBox)
+                if overlap > bestIoU {
+                    bestIoU = overlap
+                    bestID = id
+                }
+            }
+
+            if let id = bestID {
+                // Match ditemukan — update EMA
+                matchedIDs.insert(id)
+                var tracked = trackedDetections[id]!
+
+                tracked.smoothedConfidence = emaAlpha * det.confidence + (1 - emaAlpha) * tracked.smoothedConfidence
+
+                let nb = det.boundingBox
+                let ob = tracked.smoothedBox
+                tracked.smoothedBox = CGRect(
+                    x:      CGFloat(emaAlpha) * nb.minX   + CGFloat(1 - emaAlpha) * ob.minX,
+                    y:      CGFloat(emaAlpha) * nb.minY   + CGFloat(1 - emaAlpha) * ob.minY,
+                    width:  CGFloat(emaAlpha) * nb.width  + CGFloat(1 - emaAlpha) * ob.width,
+                    height: CGFloat(emaAlpha) * nb.height + CGFloat(1 - emaAlpha) * ob.height
+                )
+                tracked.missedFrames = 0
+                tracked.confirmedFrames += 1
+                trackedDetections[id] = tracked
+            } else {
+                unmatchedDetections.append(det)
+            }
+        }
+
+        // Naikkan missedFrames untuk yang tidak ke-match frame ini
+        // confirmedFrames TIDAK di-reset — biar ga kedip kalau hilang 1-2 frame
+        for id in trackedDetections.keys where !matchedIDs.contains(id) {
+            trackedDetections[id]?.missedFrames += 1
+        }
+
+        // Hapus yang sudah terlalu lama hilang
+        trackedDetections = trackedDetections.filter { $0.value.missedFrames <= maxMissedFrames }
+
+        // Tambahkan objek baru
+        for det in unmatchedDetections {
+            let newID = UUID()
+            trackedDetections[newID] = TrackedDetection(
+                id: newID,
+                classIndex: det.classIndex,
+                smoothedConfidence: det.confidence * 0.7,
+                smoothedBox: det.boundingBox,
+                missedFrames: 0,
+                confirmedFrames: 1
+            )
+        }
+
+        return trackedDetections.values
+            .filter { $0.confirmedFrames >= minFramesToShow && $0.smoothedConfidence >= confidenceThreshold }
+            .map { tracked in
+                DetectionResult(
+                    classIndex: tracked.classIndex,
+                    confidence: tracked.smoothedConfidence,
+                    boundingBox: tracked.smoothedBox
+                )
+            }
+    }
+
+    // MARK: - Safe Raw Tensor Parser
     private func safeParseRawOutput(_ observations: [VNCoreMLFeatureValueObservation]) -> [DetectionResult] {
         guard let obs = observations.first,
               let multiArray = obs.featureValue.multiArrayValue else { return [] }
@@ -198,49 +225,33 @@ class GroceryDetector: ObservableObject {
         let shape = multiArray.shape.map { $0.intValue }
         print("🔢 Output shape: \(shape)")
 
-        let featCount = numClasses + 4  // 20
+        let featCount = numClasses + 4
 
-        // Determine layout
-        // [batch, featCount, anchors] → transposed=false
-        // [batch, anchors, featCount] → transposed=true
         let anchors: Int
         let transposed: Bool
 
         if shape.count == 3 {
             if shape[1] == featCount {
-                anchors = shape[2]
-                transposed = false
+                anchors = shape[2]; transposed = false
                 print("📐 Layout: [batch=\(shape[0]), features=\(shape[1]), anchors=\(shape[2])]")
             } else if shape[2] == featCount {
-                anchors = shape[1]
-                transposed = true
+                anchors = shape[1]; transposed = true
                 print("📐 Layout: [batch=\(shape[0]), anchors=\(shape[1]), features=\(shape[2])] (transposed)")
             } else {
-                print("⚠️ Unexpected shape: \(shape)")
-                return []
+                print("⚠️ Unexpected shape: \(shape)"); return []
             }
         } else if shape.count == 2 {
-            if shape[0] == featCount {
-                anchors = shape[1]; transposed = false
-            } else {
-                anchors = shape[0]; transposed = true
-            }
+            if shape[0] == featCount { anchors = shape[1]; transposed = false }
+            else { anchors = shape[0]; transposed = true }
         } else {
-            print("⚠️ Cannot handle shape: \(shape)")
-            return []
+            print("⚠️ Cannot handle shape: \(shape)"); return []
         }
 
         var results: [DetectionResult] = []
 
-        // Use safe Swift subscript instead of raw pointer
         for i in 0..<anchors {
             func val(_ f: Int) -> Float {
-                let idx: Int
-                if transposed {
-                    idx = i * featCount + f
-                } else {
-                    idx = f * anchors + i
-                }
+                let idx = transposed ? i * featCount + f : f * anchors + i
                 return multiArray[idx].floatValue
             }
 
@@ -255,13 +266,13 @@ class GroceryDetector: ObservableObject {
 
             guard maxConf >= confidenceThreshold else { continue }
 
-            // Normalize to 0..1 (model input 640x640)
-            let x = CGFloat((cx - w / 2) / 640)
-            let y = CGFloat((cy - h / 2) / 640)
+            let x  = CGFloat((cx - w / 2) / 640)
+            let y  = CGFloat((cy - h / 2) / 640)
             let bw = CGFloat(w / 640)
             let bh = CGFloat(h / 640)
 
-            guard bw > 0, bh > 0, x >= -0.5, y >= -0.5 else { continue }
+            guard bw > 0.02, bh > 0.02, bw < 0.95, bh < 0.95 else { continue }
+            guard x >= -0.1, y >= -0.1 else { continue }
 
             results.append(DetectionResult(
                 classIndex: maxClass,
@@ -274,21 +285,26 @@ class GroceryDetector: ObservableObject {
         return results
     }
 
-    // MARK: - NMS
+    // MARK: - NMS Per Class
     private func applyNMS(detections: [DetectionResult]) -> [DetectionResult] {
-        let sorted = detections.sorted { $0.confidence > $1.confidence }
-        var kept: [DetectionResult] = []
-        var suppressed = [Bool](repeating: false, count: sorted.count)
-        for i in 0..<sorted.count {
-            guard !suppressed[i] else { continue }
-            kept.append(sorted[i])
-            for j in (i+1)..<sorted.count {
-                if iou(sorted[i].boundingBox, sorted[j].boundingBox) > CGFloat(iouThreshold) {
-                    suppressed[j] = true
+        let grouped = Dictionary(grouping: detections) { $0.classIndex }
+        var result: [DetectionResult] = []
+
+        for (_, classDetections) in grouped {
+            let sorted = classDetections.sorted { $0.confidence > $1.confidence }
+            var suppressed = [Bool](repeating: false, count: sorted.count)
+
+            for i in 0..<sorted.count {
+                guard !suppressed[i] else { continue }
+                result.append(sorted[i])
+                for j in (i+1)..<sorted.count {
+                    if iou(sorted[i].boundingBox, sorted[j].boundingBox) > CGFloat(iouThreshold) {
+                        suppressed[j] = true
+                    }
                 }
             }
         }
-        return kept
+        return result
     }
 
     private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
