@@ -25,7 +25,7 @@ class GroceryDetector: ObservableObject {
 
     let confidenceThreshold: Float = 0.55
     let iouThreshold: Float = 0.30
-    private let numClasses = 16
+    private let numClasses = 12
 
     // MARK: - Temporal Smoothing Config
     private let emaAlpha: Float = 0.30            // smoothing speed
