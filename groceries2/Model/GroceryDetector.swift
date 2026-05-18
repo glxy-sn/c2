@@ -11,7 +11,7 @@ private struct TrackedDetection {
     var smoothedConfidence: Float
     var smoothedBox: CGRect
     var missedFrames: Int = 0
-    var confirmedFrames: Int = 0  // berapa frame sudah muncul berturut
+    var confirmedFrames: Int = 0
 }
 
 class GroceryDetector: ObservableObject {
@@ -28,12 +28,13 @@ class GroceryDetector: ObservableObject {
     private let numClasses = 12
 
     // MARK: - Temporal Smoothing Config
-    private let emaAlpha: Float = 0.30            // smoothing speed
-    private let maxMissedFrames: Int = 10         // frame sebelum dihapus
-    private let minFramesToShow: Int = 1          // frame sebelum ditampilkan
-    private let matchIoUThreshold: CGFloat = 0.25 // IoU minimum buat match ke tracked obj
+    // FIX: Lebih lambat & toleran saat kamera goyang
+    private let emaAlpha: Float = 0.20            // lebih kecil = lebih smooth (was 0.30)
+    private let maxMissedFrames: Int = 18         // lebih toleran sebelum hapus (was 10)
+    private let minFramesToShow: Int = 3          // butuh konfirmasi 3 frame sebelum tampil (was 1)
+    private let matchIoUThreshold: CGFloat = 0.10 // minimum IoU untuk match (dipakai bersama distance)
+    private let maxCenterDistance: CGFloat = 0.20 // FIX: fallback matching by center distance (normalized)
 
-    // Key: UUID per instance objek — beda dari sebelumnya yang pakai classIndex
     private var trackedDetections: [UUID: TrackedDetection] = [:]
 
     init() { loadModel() }
@@ -136,33 +137,37 @@ class GroceryDetector: ObservableObject {
         DispatchQueue.main.async { self.detections = smoothed }
     }
 
-    // MARK: - IoU-based Instance Tracker
-    // Perbedaan utama dari versi lama:
-    // - Tiap objek punya UUID sendiri, bukan pakai classIndex sebagai key
-    // - Match pakai IoU, bukan asumsi 1 class = 1 objek
-    // - confirmedFrames tidak di-reset kalau hilang sebentar
+    // MARK: - IoU-based Instance Tracker (with distance fallback)
     private func updateTracker(with newDetections: [DetectionResult]) -> [DetectionResult] {
         var matchedIDs = Set<UUID>()
-
         var unmatchedDetections: [DetectionResult] = []
 
         for det in newDetections {
-            // Cari tracked object yang paling overlap dengan class yang sama
+            // FIX: Scoring gabungan IoU + center distance, tidak hanya IoU
             var bestID: UUID? = nil
-            var bestIoU: CGFloat = matchIoUThreshold
+            var bestScore: CGFloat = -1
 
             for (id, tracked) in trackedDetections {
                 guard tracked.classIndex == det.classIndex else { continue }
                 guard !matchedIDs.contains(id) else { continue }
-                let overlap = iou(tracked.smoothedBox, det.boundingBox)
-                if overlap > bestIoU {
-                    bestIoU = overlap
+
+                let overlapIoU = iou(tracked.smoothedBox, det.boundingBox)
+                let dist = centerDistance(tracked.smoothedBox, det.boundingBox)
+
+                // Match valid jika: IoU cukup ATAU (IoU rendah tapi center dekat)
+                // Ini yang bikin tahan goyang — saat goyang, IoU turun tapi center masih dekat
+                let distScore = max(0, 1.0 - dist / maxCenterDistance)
+                let combinedScore = overlapIoU * 0.5 + distScore * 0.5
+
+                let isValidMatch = overlapIoU >= matchIoUThreshold || dist < maxCenterDistance
+
+                if isValidMatch && combinedScore > bestScore {
+                    bestScore = combinedScore
                     bestID = id
                 }
             }
 
             if let id = bestID {
-                // Match ditemukan — update EMA
                 matchedIDs.insert(id)
                 var tracked = trackedDetections[id]!
 
@@ -184,8 +189,7 @@ class GroceryDetector: ObservableObject {
             }
         }
 
-        // Naikkan missedFrames untuk yang tidak ke-match frame ini
-        // confirmedFrames TIDAK di-reset — biar ga kedip kalau hilang 1-2 frame
+        // Naikkan missedFrames untuk yang tidak ke-match
         for id in trackedDetections.keys where !matchedIDs.contains(id) {
             trackedDetections[id]?.missedFrames += 1
         }
@@ -193,13 +197,22 @@ class GroceryDetector: ObservableObject {
         // Hapus yang sudah terlalu lama hilang
         trackedDetections = trackedDetections.filter { $0.value.missedFrames <= maxMissedFrames }
 
-        // Tambahkan objek baru
-        for det in unmatchedDetections {
+        // FIX: Cegah objek baru jika sudah ada tracked object dengan class sama yang dekat
+        // Ini mencegah duplikat saat goyang ekstrem (IoU = 0 tapi sebenarnya objek sama)
+        let filteredUnmatched = unmatchedDetections.filter { det in
+            !trackedDetections.values.contains { tracked in
+                tracked.classIndex == det.classIndex &&
+                centerDistance(tracked.smoothedBox, det.boundingBox) < maxCenterDistance * 1.5
+            }
+        }
+
+        // Tambahkan objek baru yang benar-benar baru
+        for det in filteredUnmatched {
             let newID = UUID()
             trackedDetections[newID] = TrackedDetection(
                 id: newID,
                 classIndex: det.classIndex,
-                smoothedConfidence: det.confidence * 0.7,
+                smoothedConfidence: det.confidence * 0.6,  // mulai lebih rendah, butuh konfirmasi
                 smoothedBox: det.boundingBox,
                 missedFrames: 0,
                 confirmedFrames: 1
@@ -313,6 +326,13 @@ class GroceryDetector: ObservableObject {
         let interArea = inter.width * inter.height
         let unionArea = a.width * a.height + b.width * b.height - interArea
         return unionArea > 0 ? interArea / unionArea : 0
+    }
+
+    // FIX: Helper baru — jarak antar center (normalized 0..1)
+    private func centerDistance(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let dx = a.midX - b.midX
+        let dy = a.midY - b.midY
+        return sqrt(dx * dx + dy * dy)
     }
 
     private func classIndexFromLabel(_ label: String) -> Int {
